@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -13,6 +14,30 @@ DATA = Path("data")
 DATA.mkdir(exist_ok=True)
 PREV = DATA / "prev_prices.json"
 HIST = DATA / "index_history.csv"
+
+# 兜底用近似流通/市值（亿元）。只影响权重，价格仍用实时行情。
+APPROX_A_CIRC_YI = {
+    "002594": 3100,
+    "601633": 860,
+    "000625": 600,
+    "600104": 1250,
+    "601238": 500,
+    "601127": 810,
+    "600733": 280,
+    "600418": 500,
+}
+
+APPROX_H_MKT_YI = {
+    "01211": 3500,
+    "00175": 1600,
+    "09973": 600,
+    "02333": 350,
+    "02015": 1400,
+    "09866": 800,
+    "09868": 1400,
+    "09863": 500,
+    "09927": 700,
+}
 
 
 def fx_rate():
@@ -53,43 +78,166 @@ def fnum(x):
         return None
 
 
+def _sina_a_list():
+    out = []
+    for c in A_CODES:
+        c = c.zfill(6)
+        prefix = "sh" if c.startswith("6") else "sz"
+        out.append(prefix + c)
+    return out
+
+
 def fetch_a():
+    """东财优先（重试3次），失败则新浪价格 + 近似市值。"""
     out = {}
-    df = ak.stock_zh_a_spot_em()
-    df["代码"] = df["代码"].astype(str).str.zfill(6)
-    for code in A_CODES:
-        r = df[df["代码"] == code]
-        if r.empty:
-            continue
-        row = r.iloc[0]
-        price = fnum(row.get("最新价"))
-        mkt = fnum(row.get("流通市值")) or fnum(row.get("总市值"))
-        if not price or not mkt:
-            continue
-        if mkt < 1e8:
-            mkt *= 1e8
-        out[code] = {"price": price, "mkt_cny": mkt, "name": str(row.get("名称", code))}
+
+    for i in range(3):
+        try:
+            df = ak.stock_zh_a_spot_em()
+            df["代码"] = df["代码"].astype(str).str.zfill(6)
+            for code in A_CODES:
+                r = df[df["代码"] == code]
+                if r.empty:
+                    continue
+                row = r.iloc[0]
+                price = fnum(row.get("最新价"))
+                mkt = fnum(row.get("流通市值")) or fnum(row.get("总市值"))
+                if not price or not mkt:
+                    continue
+                if mkt < 1e8:
+                    mkt *= 1e8
+                out[code] = {
+                    "price": price,
+                    "mkt_cny": mkt,
+                    "name": str(row.get("名称", code)),
+                }
+            if out:
+                print("fetch_a: eastmoney ok", len(out))
+                return out
+        except Exception as e:
+            print(f"fetch_a eastmoney try {i + 1} fail:", e)
+            time.sleep(2)
+
+    try:
+        url = "https://hq.sinajs.cn/list=" + ",".join(_sina_a_list())
+        headers = {
+            "Referer": "https://finance.sina.com.cn",
+            "User-Agent": "Mozilla/5.0",
+        }
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.encoding = "gbk"
+        for line in resp.text.splitlines():
+            if "hq_str_" not in line or '=""' in line or '=""' in line:
+                continue
+            try:
+                left, right = line.split("=", 1)
+                raw = left.split("_")[-1]
+                code = raw.replace("sh", "").replace("sz", "").zfill(6)
+                parts = right.strip().strip(";").strip('"').split(",")
+                if len(parts) < 4:
+                    continue
+                price = fnum(parts[3])
+                if not price or price <= 0:
+                    continue
+                yi = APPROX_A_CIRC_YI.get(code, 500)
+                out[code] = {
+                    "price": price,
+                    "mkt_cny": yi * 1e8,
+                    "name": parts[0] or code,
+                }
+            except Exception:
+                continue
+        if out:
+            print("fetch_a: sina ok", len(out))
+            return out
+    except Exception as e:
+        print("fetch_a sina fail:", e)
+
+    print("fetch_a: all failed")
     return out
 
 
 def fetch_h(fx):
+    """东财优先（重试3次），失败则腾讯价格 + 近似市值。"""
     out = {}
-    df = ak.stock_hk_spot_em()
-    df["_c"] = df["代码"].astype(str).str.replace(".HK", "").str.zfill(5)
-    mkt_col = "市值" if "市值" in df.columns else ("总市值" if "总市值" in df.columns else None)
-    for code in H_CODES:
-        c = code.zfill(5)
-        r = df[df["_c"] == c]
-        if r.empty:
-            continue
-        row = r.iloc[0]
-        price = fnum(row.get("最新价"))
-        mkt_hkd = fnum(row[mkt_col]) if mkt_col else None
-        if not price or not mkt_hkd:
-            continue
-        if mkt_hkd < 1e6:
-            mkt_hkd *= 1e8
-        out[c] = {"price": price, "mkt_cny": mkt_hkd * fx, "name": str(row.get("名称", c))}
+
+    for i in range(3):
+        try:
+            df = ak.stock_hk_spot_em()
+            df["_c"] = (
+                df["代码"].astype(str).str.replace(".HK", "", regex=False).str.zfill(5)
+            )
+            mkt_col = None
+            for c in ["市值", "总市值", "流通市值"]:
+                if c in df.columns:
+                    mkt_col = c
+                    break
+            for code in H_CODES:
+                c = code.zfill(5)
+                r = df[df["_c"] == c]
+                if r.empty:
+                    continue
+                row = r.iloc[0]
+                price = fnum(row.get("最新价"))
+                mkt_hkd = fnum(row[mkt_col]) if mkt_col else None
+                if not price or not mkt_hkd:
+                    continue
+                if mkt_hkd < 1e6:
+                    mkt_hkd *= 1e8
+                out[c] = {
+                    "price": price,
+                    "mkt_cny": mkt_hkd * fx,
+                    "name": str(row.get("名称", c)),
+                }
+            if out:
+                print("fetch_h: eastmoney ok", len(out))
+                return out
+        except Exception as e:
+            print(f"fetch_h eastmoney try {i + 1} fail:", e)
+            time.sleep(2)
+
+    try:
+        want = {c.zfill(5) for c in H_CODES}
+        symbols = ",".join("r" + c.zfill(5) for c in H_CODES)
+        url = f"https://qt.gtimg.cn/q={symbols}"
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.qq.com"}
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.encoding = "gbk"
+        for seg in resp.text.split(";"):
+            if "~" not in seg:
+                continue
+            parts = seg.split("~")
+            if len(parts) < 6:
+                continue
+            try:
+                # 腾讯港股: 名称~代码~现价 等，位置可能微调
+                code = None
+                price = None
+                name = parts[1] if len(parts) > 1 else ""
+                for p in parts[1:6]:
+                    p2 = str(p).zfill(5)
+                    if p2 in want:
+                        code = p2
+                        break
+                # 现价常见在 parts[3]
+                price = fnum(parts[3])
+                if code is None or not price or price <= 0:
+                    continue
+                yi = APPROX_H_MKT_YI.get(code, 500)
+                out[code] = {
+                    "price": price,
+                    "mkt_cny": yi * 1e8 * fx,
+                    "name": name or code,
+                }
+            except Exception:
+                continue
+        if out:
+            print("fetch_h: tencent ok", len(out))
+            return out
+    except Exception as e:
+        print("fetch_h tencent fail:", e)
+
+    print("fetch_h: all failed")
     return out
 
 
@@ -158,7 +306,9 @@ def update_hist(ra, rh, rah, fx):
     if HIST.exists():
         hist = pd.read_csv(HIST)
         last = hist.iloc[-1]
-        la, lh, lah = float(last["index_a"]), float(last["index_h"]), float(last["index_ah"])
+        la = float(last["index_a"])
+        lh = float(last["index_h"])
+        lah = float(last["index_ah"])
     else:
         hist = pd.DataFrame()
         la = lh = lah = BASE_LEVEL
@@ -201,7 +351,9 @@ def notify(text):
     wh = os.environ.get("WECOM_WEBHOOK_URL")
     if wh:
         try:
-            requests.post(wh, json={"msgtype": "text", "text": {"content": text}}, timeout=30)
+            requests.post(
+                wh, json={"msgtype": "text", "text": {"content": text}}, timeout=30
+            )
             print("wecom ok")
         except Exception as e:
             print("wecom fail", e)
@@ -210,38 +362,45 @@ def notify(text):
 
 
 def main():
-    fx = fx_rate()
-    print("FX", fx)
-    a = fetch_a()
-    h = fetch_h(fx)
-    print("A", len(a), "H", len(h))
-    if len(a) + len(h) < 3:
-        notify(f"取数失败 A={len(a)} H={len(h)}")
-        return
+    try:
+        fx = fx_rate()
+        print("FX", fx)
+        a = fetch_a()
+        h = fetch_h(fx)
+        print("A", len(a), "H", len(h))
+        if len(a) + len(h) < 3:
+            notify(f"取数失败 A={len(a)} H={len(h)}")
+            return
 
-    prev = load_prev()
-    ra = simple_side(a, prev, "A")
-    rh = simple_side(h, prev, "H")
-    rah = index_return(build_ah(a, h, prev))
+        prev = load_prev()
+        ra = simple_side(a, prev, "A")
+        rh = simple_side(h, prev, "H")
+        rah = index_return(build_ah(a, h, prev))
 
-    la, lh, lah = update_hist(ra, rh, rah, fx)
+        la, lh, lah = update_hist(ra, rh, rah, fx)
 
-    prices = {f"A:{k}": v["price"] for k, v in a.items()}
-    prices.update({f"H:{k}": v["price"] for k, v in h.items()})
-    save_prev(prices)
+        prices = {f"A:{k}": v["price"] for k, v in a.items()}
+        prices.update({f"H:{k}": v["price"] for k, v in h.items()})
+        save_prev(prices)
 
-    def pct(x):
-        return f"{x*100:+.2f}%" if x is not None else "首日"
+        def pct(x):
+            return f"{x * 100:+.2f}%" if x is not None else "首日"
 
-    msg = (
-        f"【整车指数CNY 无上限 双上市合并】\n"
-        f"FX={fx:.4f}\n"
-        f"A : {la:.2f} ({pct(ra)}) n={len(a)}\n"
-        f"H : {lh:.2f} ({pct(rh)}) n={len(h)}\n"
-        f"AH: {lah:.2f} ({pct(rah)})\n"
-    )
-    print(msg)
-    notify(msg)
+        msg = (
+            f"【整车指数CNY 无上限 双上市合并】\n"
+            f"FX={fx:.4f}\n"
+            f"A : {la:.2f} ({pct(ra)}) n={len(a)}\n"
+            f"H : {lh:.2f} ({pct(rh)}) n={len(h)}\n"
+            f"AH: {lah:.2f} ({pct(rah)})\n"
+        )
+        print(msg)
+        notify(msg)
+    except Exception as e:
+        import traceback
+
+        print(traceback.format_exc())
+        notify(f"脚本异常: {e}")
+        raise
 
 
 if __name__ == "__main__":
